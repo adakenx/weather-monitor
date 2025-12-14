@@ -35,6 +35,10 @@ class WeatherMonitor:
         self.chat_id = TELEGRAM_CHAT_ID
         self.thresholds = EXTREME_WEATHER_THRESHOLDS
     
+    def log(self, msg):
+        """打印带时间戳的日志"""
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
+    
     def get_weather_data(self):
         """获取当前天气数据"""
         url = "https://api.openweathermap.org/data/2.5/weather"
@@ -50,7 +54,7 @@ class WeatherMonitor:
             response.raise_for_status()
             return response.json()
         except requests.RequestException as e:
-            print(f"[错误] 获取天气数据失败: {e}")
+            self.log(f"[错误] 获取天气数据失败: {e}")
             return None
     
     def get_forecast_data(self):
@@ -68,7 +72,7 @@ class WeatherMonitor:
             response.raise_for_status()
             return response.json()
         except requests.RequestException as e:
-            print(f"[错误] 获取预报数据失败: {e}")
+            self.log(f"[错误] 获取预报数据失败: {e}")
             return None
     
     def get_air_quality(self):
@@ -85,7 +89,7 @@ class WeatherMonitor:
             response.raise_for_status()
             return response.json()
         except requests.RequestException as e:
-            print(f"[错误] 获取空气质量数据失败: {e}")
+            self.log(f"[错误] 获取空气质量数据失败: {e}")
             return None
     
     def calculate_aqi_from_pm25(self, pm25):
@@ -142,27 +146,27 @@ class WeatherMonitor:
         weather_id = weather.get("id", 0)
         weather_desc = weather.get("description", "")
         
-        # 高温
+        # 高温 (> 35°C)
         if temp >= self.thresholds["high_temp"]:
             alerts.append(f"{time_str} 🔥 高温 {temp:.0f}°C")
         
-        # 低温
+        # 低温 (< -10°C)
         if temp <= self.thresholds["low_temp"]:
             alerts.append(f"{time_str} ❄️ 低温 {temp:.0f}°C")
         
-        # 大风
+        # 大风 (> 10m/s)
         if wind_speed >= self.thresholds["high_wind"]:
             alerts.append(f"{time_str} 💨 大风 {wind_speed:.0f}m/s")
         
-        # 中雨及以上 (501=中雨, 502+=大雨)
+        # 中雨及以上 (501=中雨, 502=大雨, 503=暴雨, 504=极端降雨, 511=冻雨, 520-531=阵雨)
         if self.thresholds.get("moderate_rain") and 501 <= weather_id <= 531:
             alerts.append(f"{time_str} 🌧️ {weather_desc}")
         
-        # 任何降雪 (600-622)
+        # 任何降雪 (600-622: 各种雪)
         if self.thresholds.get("any_snow") and 600 <= weather_id <= 622:
             alerts.append(f"{time_str} 🌨️ {weather_desc}")
         
-        # 雷暴
+        # 雷暴 (200-299)
         if 200 <= weather_id < 300:
             alerts.append(f"{time_str} ⛈️ {weather_desc}")
         
@@ -196,10 +200,10 @@ class WeatherMonitor:
         try:
             response = requests.post(url, json=payload, timeout=10)
             response.raise_for_status()
-            print(f"[成功] Telegram消息已发送")
+            self.log("[成功] Telegram消息已发送")
             return True
         except requests.RequestException as e:
-            print(f"[错误] Telegram消息发送失败: {e}")
+            self.log(f"[错误] Telegram消息发送失败: {e}")
             return False
     
     def format_alert_message(self, alerts):
@@ -222,44 +226,79 @@ class WeatherMonitor:
     
     def run_once(self):
         """执行一次检查并推送（如有预警）"""
-        print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 检查北京未来2天天气...")
+        self.log("=" * 50)
+        self.log("开始检查北京未来2天天气")
+        self.log("=" * 50)
         
         all_alerts = []
         
         # 检查当前天气
+        self.log("获取当前天气...")
         current_weather = self.get_weather_data()
         if current_weather:
-            alerts = self.check_weather_alerts(current_weather, "当前")
-            all_alerts.extend(alerts)
-            
+            weather_info = current_weather.get("weather", [{}])[0]
             main = current_weather.get("main", {})
-            weather_desc = current_weather.get("weather", [{}])[0].get("description", "")
-            print(f"  当前: {weather_desc}, {main.get('temp', 'N/A'):.0f}°C")
+            wind = current_weather.get("wind", {})
+            
+            self.log(f"  当前: {weather_info.get('description', 'N/A')} (ID:{weather_info.get('id', 'N/A')})")
+            self.log(f"  温度: {main.get('temp', 'N/A'):.1f}°C, 风速: {wind.get('speed', 'N/A')} m/s")
+            
+            alerts = self.check_weather_alerts(current_weather, "当前")
+            if alerts:
+                self.log(f"  ⚠️ 当前天气预警: {alerts}")
+            all_alerts.extend(alerts)
+        else:
+            self.log("  ❌ 获取当前天气失败")
         
         # 检查空气质量
+        self.log("获取空气质量...")
         air_alert, aqi = self.check_air_quality_alert()
+        if aqi is not None:
+            self.log(f"  AQI: {aqi}" + (" ⚠️ 超标!" if air_alert else " ✓"))
         if air_alert:
             all_alerts.append(air_alert)
-        if aqi:
-            print(f"  空气质量: AQI {aqi}")
         
-        # 检查未来2天预报（16个时间点，每3小时）
+        # 检查未来2天预报
+        self.log("获取未来2天预报...")
         forecast = self.get_forecast_data()
         if forecast and "list" in forecast:
+            self.log(f"  共 {len(forecast['list'][:16])} 个时间点")
+            
             for item in forecast["list"][:16]:
                 dt_txt = item.get("dt_txt", "")
+                weather_info = item.get("weather", [{}])[0]
+                weather_id = weather_info.get("id", 0)
+                weather_desc = weather_info.get("description", "")
+                temp = item.get("main", {}).get("temp", 0)
+                
                 time_str = self.format_time_cn(dt_txt)
                 alerts = self.check_weather_alerts(item, time_str)
+                
+                # 记录特殊天气
+                if alerts or 500 <= weather_id <= 622:
+                    self.log(f"  {dt_txt} | ID:{weather_id} | {weather_desc} | {temp:.1f}°C" + 
+                            (f" | ⚠️ {alerts}" if alerts else ""))
+                
                 all_alerts.extend(alerts)
+        else:
+            self.log("  ❌ 获取预报数据失败")
         
         # 发送告警
+        self.log("-" * 50)
         if all_alerts:
+            unique_alerts = list(dict.fromkeys(all_alerts))
+            self.log(f"⚠️ 共发现 {len(unique_alerts)} 个预警")
+            
             message = self.format_alert_message(all_alerts)
             if message:
-                print(f"\n⚠️ 发现 {len(set(all_alerts))} 个预警，发送通知...")
+                self.log("发送Telegram通知...")
                 self.send_telegram_message(message)
         else:
-            print("\n✅ 未来2天天气良好，无需推送")
+            self.log("✅ 未来2天天气良好，无需推送")
+        
+        self.log("=" * 50)
+        self.log("检查完成")
+        self.log("=" * 50)
         
         return all_alerts
 
@@ -279,8 +318,9 @@ def test_connection():
         print("   ✅ 天气API连接成功")
         main = weather.get("main", {})
         wind = weather.get("wind", {})
-        weather_desc = weather.get("weather", [{}])[0].get("description", "未知")
-        print(f"   当前北京: {weather_desc}, {main.get('temp', 'N/A'):.0f}°C, 风速 {wind.get('speed', 'N/A')} m/s")
+        weather_info = weather.get("weather", [{}])[0]
+        print(f"   当前: {weather_info.get('description', 'N/A')} (ID:{weather_info.get('id', 'N/A')})")
+        print(f"   温度: {main.get('temp', 'N/A'):.1f}°C, 风速: {wind.get('speed', 'N/A')} m/s")
     else:
         print("   ❌ 天气API连接失败，请检查API Key")
         return
